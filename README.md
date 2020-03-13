@@ -1,1 +1,1 @@
-Code for a CNN from scratch using only numpy for single channel inputs (i.e Mnist digits)
+Code for a CNN from scratch using only numpy.
