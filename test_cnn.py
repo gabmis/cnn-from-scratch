@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 import numpy as np
+from tqdm import trange
 
 from base import Batcher
 from cnn import FC, Identity, SGD, MSE, Conv2D
@@ -11,7 +12,7 @@ class TestFC(TestCase):
         input_size = 5
         batch_size = 3
         inpt = np.random.rand(batch_size, input_size)
-        fc = FC(input_size, batch_size, n_neurons=2, activation=Identity())
+        fc = FC(input_size, n_neurons=2, activation=Identity())
         out = fc.forward(inpt)
         expected_shape = (batch_size, 2)
         if not out.shape == expected_shape:
@@ -35,9 +36,8 @@ class TestFC(TestCase):
         data = np.random.rand(100, 3)
         targets = np.zeros((100, 2))
         input_size = 3
-        batch_size = 20
         batcher = Batcher(data, targets, batch_size=20)
-        fc = FC(input_size, batch_size, n_neurons=2, activation=Identity())
+        fc = FC(input_size, n_neurons=2, activation=Identity())
         fc.optimizer = SGD(lr=0.1)
         loss = MSE()
         for _ in range(10000):
@@ -52,8 +52,7 @@ class TestFC(TestCase):
         # tagets are assumed to be [0, 0]
         inpt = [[1, 0], [0, 1]]
         input_size = 2
-        batch_size = 2
-        fc = FC(input_size, batch_size, n_neurons=1, activation=Identity())
+        fc = FC(input_size, n_neurons=1, activation=Identity())
         # override with test weights
         fc.weights = np.ones(2).reshape(-1, 1)
         # test error gradient
@@ -70,7 +69,7 @@ class TestFC(TestCase):
 
 
 class TestConv2D(TestCase):
-    def test_compute_grad(self):
+    def test_compute_grad_shape(self):
         """Test shapes."""
         batch_size = 4
         input_shape = (5, 5, 1)
@@ -96,25 +95,44 @@ class TestConv2D(TestCase):
                 )
             )
 
-    def test_backward(self):
-        batch_size = 20
-        input_shape = (3, 3, 1)
-        data = np.random.rand(100, *input_shape)
-        kernel_size = 2
-        n_filters = 1
-        targets = np.zeros((100, 9))
-        batcher = Batcher(data, targets, batch_size)
-        conv = Conv2D(input_shape, kernel_size, n_filters, activation=Identity())
-        conv.optimizer = SGD(lr=0.01)
-        loss = MSE()
-        for _ in range(1000):
-            done, batch, targets = batcher.next()
-            pred = conv.forward(batch)
-            deltas = loss.gradient(pred.reshape(-1, 9), targets)
-            deltas = deltas.reshape((-1, 3, 3, 1))
-            deltas = conv.activation.derivative(conv.weighted_input_memory) * deltas
-            conv.backward(deltas)
-        if not np.allclose(conv.weights, np.zeros_like(conv.weights)):
-            self.fail(
-                "Conv layer weights {} did not converge to 0.".format(conv.weights)
+    def test_compute_grad(self):
+        def test(full):
+            batch_size = 20
+            input_shape = (3, 3, 1)
+            n_samples = 1000
+            n_targets = 9 if full else 4
+            images = np.random.rand(n_samples, *input_shape)
+            kernel_size = 2
+            n_filters = 1
+            targets = np.zeros((n_samples, n_targets))
+            batcher = Batcher(images, targets, batch_size)
+            conv = Conv2D(
+                input_shape, kernel_size, n_filters, activation=Identity(), full=full
             )
+            conv.optimizer = SGD(lr=0.1)
+            loss = MSE()
+            loss_value = np.inf
+            n_epochs = 10
+            t = trange(n_epochs, desc="Loss = {}".format(np.mean(loss_value)), leave=True)
+            for _ in t:
+                loss_list = []
+                done = False
+                while not done:
+                    done, images_batch, targets_batch = batcher.next()
+                    pred = conv.forward(images_batch)
+                    pred = pred.reshape(-1, n_targets)
+                    loss_value = loss.forward(pred, targets_batch)
+                    deltas = loss.gradient(pred, targets_batch)
+                    deltas = deltas.reshape(
+                        (-1, int(np.sqrt(n_targets)), int(np.sqrt(n_targets)), 1)
+                    )
+                    deltas = conv.activation.derivative(conv.weighted_input_memory) * deltas
+                    conv.backward(deltas)
+                    loss_list.append(loss_value.mean())
+                t.set_description("Loss = {}".format(np.mean(loss_list)))
+            if not np.allclose(conv.weights, np.zeros_like(conv.weights), atol=1e-2):
+                self.fail(
+                    "Conv layer weights {} did not converge to 0 with full={}.".format(conv.weights, full)
+                )
+        test(True)
+        test(False)

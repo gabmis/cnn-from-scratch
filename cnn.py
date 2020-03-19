@@ -4,7 +4,7 @@ import numpy as np
 from tqdm import trange
 
 from base import Activation, Loss, Optimizer, Layer, Batcher
-from conv import convolution, rot180, grad_convolution, convolve2d, deltas_convolution
+from conv import convolution, grad_convolution, deltas_convolution
 
 logger = logging.getLogger(__name__)
 
@@ -42,16 +42,22 @@ class ReLU(Activation):
         return (inpt > 0).astype(float)
 
 
-class Softmax(Activation):
+def softmax(inpt, epsilon=1e-6):
+    # substract max component for each vector to prevent overlflow
+    exp_x = np.exp(inpt - inpt.max(axis=1)[:, None])
+    return exp_x / exp_x.sum(axis=1)[:, None]
+
+
+class SoftmaxCrossEntropy(Loss):
     def __init__(self):
         super().__init__()
-        pass
 
-    def forward(self, inpt):
-        pass
+    def forward(self, inpt, targets):
+        return -(targets * np.log(softmax(inpt) + 1e-6)).sum(axis=1)
 
-    def derivative(self, inpt):
-        pass
+    def gradient(self, inpt, targets):
+        softmax_inpt = softmax(inpt)
+        return softmax_inpt - targets
 
 
 class MSE(Loss):
@@ -75,30 +81,31 @@ class SGD(Optimizer):
 
 
 class FC(Layer):
-    def __init__(
-        self, input_size, batch_size, n_neurons, activation: Activation = Sigmoid()
-    ):
+    def __init__(self, input_shape, n_neurons, activation: Activation = Identity()):
         super().__init__()
-        self.input_size = input_size
-        self.batch_size = batch_size
+        self.input_shape = input_shape
+        self.input_size = input_shape[0]
         self.n_neurons = n_neurons
         self.activation = activation
         self.initialize_weights()
 
     def initialize_weights(self):
-        # TODO: use standard initialization
-        self.weights = np.random.rand(self.n_neurons, self.input_size + 1)
+        self.weights = (
+            2
+            / self.input_size
+            * np.random.normal(0, 1, (self.n_neurons, self.input_size + 1))
+        )
 
     def forward(self, inpt):
-        self.input_memory = np.column_stack([inpt, np.ones(self.batch_size)])
+        self.input_memory = np.column_stack([inpt, np.ones(inpt.shape[0])])
         self.weighted_input_memory = np.einsum(
             "ij,bj->bi", self.weights, self.input_memory
         )
         return self.activation.forward(self.weighted_input_memory)
 
-    def backward(self, deltas):
+    def backward(self, deltas, optimizer):
         grads, deltas = self.compute_grads(deltas)
-        self.weights = self.optimizer.step(self.weights, grads)
+        self.weights = optimizer.step(self.weights, grads)
         return deltas
 
     def compute_grads(self, deltas, return_deltas=True):
@@ -106,19 +113,27 @@ class FC(Layer):
         # backprop recursion
         deltas = np.einsum("ij,bj->bi", self.weights.T, deltas)
         if return_deltas:
-            return grads, deltas
+            # remove bias dimension
+            return grads, deltas[:, :-1]
         return grads
 
 
 class Flatten(Layer):
-    def __init__(self):
+    def __init__(self, input_shape):
         super().__init__()
+        self.input_shape = input_shape
+
+    def initialize_weights(self):
+        pass
 
     def forward(self, inpt):
         self.input_shape = inpt.shape[1:]
         return inpt.reshape(inpt.shape[0], -1)
 
-    def backward(self, deltas):
+    def compute_grads(self, deltas):
+        pass
+
+    def backward(self, deltas, optimizer):
         return deltas.reshape((-1, *self.input_shape))
 
 
@@ -140,19 +155,24 @@ class Conv2D(Layer):
         self.initialize_weights()
 
     def initialize_weights(self):
-        # TODO: use standard initialization
-        self.weights = np.random.rand(
-            self.n_filters, self.kernel_size, self.kernel_size, self.input_shape[-1]
+        self.weights = np.random.normal(
+            0,
+            1,
+            (self.n_filters, self.kernel_size, self.kernel_size, self.input_shape[-1]),
         )
+        self.weights = (
+            np.sqrt(2)
+            / np.sqrt(self.kernel_size * self.kernel_size * self.input_shape[-1])
+        ) * self.weights
 
     def forward(self, inpt):
         self.input_memory = inpt
         self.weighted_input_memory = convolution(inpt, self.weights, self.full)
         return self.activation.forward(self.weighted_input_memory)
 
-    def backward(self, deltas):
+    def backward(self, deltas, optimizer):
         grads, deltas = self.compute_grads(deltas)
-        self.optimizer.step(self.weights, grads)
+        self.weights = optimizer.step(self.weights, grads)
         return deltas
 
     def compute_grads(self, deltas, return_deltas=True):
@@ -164,43 +184,59 @@ class Conv2D(Layer):
 
 
 class CNN:
-    def __init__(self, layers, loss: Loss, optimizer: Optimizer, batcher: Batcher):
+    def __init__(self, layers, loss: Loss, optimizer: Optimizer, pred_func=None):
         self.layers = layers
         self.loss = loss
         self.optimizer = optimizer
-        self.batcher = batcher
-        self.check_shape_compatibility()
+        self.pred_func = pred_func
 
-    def check_shape_compatibility(self):
+    def check_shape_compatibility(self, batcher):
         try:
-            self.forward(self.batcher.next())
+            done, inpt, targets = batcher.next()
+            self.forward(inpt)
         except Exception:
             logger.exception("Exception in forward pass, check your shapes.")
             raise
 
-    def train(self, n_epochs):
-        loss = [0]
+    def train(self, batcher, n_epochs):
+        history = []
+        loss = np.inf
         t = trange(n_epochs, desc="Loss = {}".format(np.mean(loss)), leave=True)
         for _ in t:
             done = False
             while not done:
-                done, batch, targets = self.batcher.next()
-                loss.append(self.backpropagate(batch, targets))
-            t.set_description("Loss = {}".format(np.mean(loss)))
+                done, batch, targets = batcher.next()
+                loss = self.backpropagate(batch, targets)
+                history.append(loss)
+                t.set_description("Loss = {}".format(np.mean(loss)))
+        return history
 
     def forward(self, inpt, targets=None):
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             inpt = layer.forward(inpt)
-        out = self.loss.forward(inpt, targets) if targets is not None else inpt
-        return out
+            if np.isnan(inpt).sum() > 0 or np.isinf(inpt).sum() > 0:
+                logger.warning("Output of layer {} has NaNs.".format(i))
+        if targets is not None:
+            loss_value = self.loss.forward(inpt, targets)
+            return inpt, loss_value
+        else:
+            return inpt
 
     def backpropagate(self, batch, targets):
         # perform forward pass and store activations
-        losses = self.forward(batch, targets)
+        output, loss_values = self.forward(batch, targets)
         # initial delta
-        deltas = self.loss.gradient(batch, targets)
+        deltas = self.loss.gradient(output, targets)
         # backpropagate deltas
         for layer in self.layers[::-1]:
-            deltas = layer.activation.derivative(layer.weighted_input_memory) * deltas
-            deltas = layer.backward(deltas)
-        return losses.mean()
+            if layer.activation is not None:
+                deltas = (
+                    layer.activation.derivative(layer.weighted_input_memory) * deltas
+                )
+            deltas = layer.backward(deltas, self.optimizer)
+        return loss_values.mean()
+
+    def predict(self, inpt):
+        pred = self.forward(inpt)
+        pred = self.pred_func(pred) if self.pred_func is not None else pred
+        return pred

@@ -8,9 +8,14 @@ class Layer(ABC):
         self.input_shape = None
         self.weights = None
         self.activation = None
-        self.optimizer = None
         self.input_memory = None
+        self.weighted_input_memory = None
         pass
+
+    @property
+    def output_shape(self):
+        inpt = np.zeros((1, *self.input_shape))
+        return self.forward(inpt).shape[1:]
 
     @abstractmethod
     def initialize_weights(self):
@@ -18,10 +23,6 @@ class Layer(ABC):
 
     @abstractmethod
     def forward(self, inpt):
-        pass
-
-    @abstractmethod
-    def backward(self, deltas):
         pass
 
     @abstractmethod
